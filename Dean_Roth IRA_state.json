@@ -1,0 +1,11 @@
+{
+  "cost_basis": 65.65,
+  "last_updated": "2026-05-14",
+  "previous_basis": 43.50,
+  "trigger_pct": 0.30,
+  "transfer_pct": 0.30,
+  "div_etf": "QQQI",
+  "rule_version": "R3 (V2.4)",
+  "cash_pct": null,
+  "note": "V2.4 전환 (R3 룰 + QQQI). cost_basis는 마지막 매도가/체결가(최초 원가 아님). 다음 트리거 = CB × 1.30. cash_pct=null → 신호가 양쪽 기준(현금≥5%:100% QQQI / <5%:50:50)을 모두 안내, 분배는 Dean이 현금 비중 보고 수동 결정. (특정 값을 넣으면 자동 판정 모드로 전환됨.)"
+}
