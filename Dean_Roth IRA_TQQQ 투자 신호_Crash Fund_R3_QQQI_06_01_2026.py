@@ -37,6 +37,8 @@ import yfinance as yf
 import pandas as pd
 import json
 import os
+import math
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo  # CT 시간대 변환용
 import smtplib
@@ -153,22 +155,70 @@ CONFIG = {
 # ─────────────────────────────────────────────
 # 데이터 수집
 # ─────────────────────────────────────────────
+class DataFetchError(RuntimeError):
+    """주가 수집 실패. 이 예외가 나면 절대 메일을 보내지 않는다."""
+
+
+def fetch_history(symbol, period, required=True, tries=4, min_rows=1):
+    """
+    yfinance 조회 + 재시도 + NaN 검증.
+
+    Yahoo는 아직 값이 안 채워진 바(bar)를 맨 뒤에 하나 붙여서 준다.
+    (2026-09-12 확인: close 배열 마지막 값이 None)
+    기존 코드는 `hist.empty` 만 검사했는데, 그 빈 행 때문에 empty 는 False 가 되고
+    `.iloc[-1]` 이 하필 그 행을 집어 NaN 이 전파된다 → $nan 메일.
+    그래서 여기서 NaN 행을 직접 도려낸다.
+    """
+    last_err = "원인 미상"
+    for attempt in range(1, tries + 1):
+        try:
+            hist = yf.Ticker(symbol).history(
+                period=period, auto_adjust=True, repair=False
+            )
+            if hist is None or hist.empty:
+                last_err = "빈 응답 (empty DataFrame)"
+            elif "Close" not in hist.columns:
+                last_err = f"Close 컴럼 없음 (columns={list(hist.columns)})"
+            else:
+                clean = hist[hist["Close"].notna()]
+                if len(clean) < min_rows:
+                    last_err = (
+                        f"Close 유효행 {len(clean)}개 < 최소 {min_rows}개 "
+                        f"(전체 {len(hist)}행 — NaN 응답)"
+                    )
+                else:
+                    if attempt > 1:
+                        print(f"   ↳ {symbol}: {attempt}회차에서 성공")
+                    return clean
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+
+        if attempt < tries:
+            wait = 5 * attempt          # 5s, 10s, 15s — Yahoo 레이트리밋 완화
+            print(f"   ⚠️  {symbol} {attempt}/{tries} 실패 ({last_err}) → {wait}초 후 재시도")
+            time.sleep(wait)
+
+    msg = f"{symbol} {tries}회 모두 실패 — {last_err}"
+    if required:
+        raise DataFetchError(msg)
+    print(f"   ⚠️  {msg} (필수 아님 → N/A 처리)")
+    return None
+
+
+def _bad(v):
+    """None 이거나 NaN 이면 True."""
+    return v is None or (isinstance(v, float) and math.isnan(v))
+
+
 def get_signals():
     print("\n⏳ 실시간 데이터 수집 중...")
 
     yf.set_tz_cache_location("/tmp/yf_no_cache")
 
-    qqq_ticker  = yf.Ticker("QQQ")
-    tqqq_ticker = yf.Ticker("TQQQ")
-    div_ticker  = yf.Ticker(DIV_ETF)   # V2.4: QQQI
-
-    qqq_hist  = qqq_ticker.history(period="18mo", auto_adjust=True, repair=False)
-    tqqq_hist = tqqq_ticker.history(period="5y",  auto_adjust=True, repair=False)
-    div_hist  = div_ticker.history(period="5d",   auto_adjust=True, repair=False)
-
-    if qqq_hist.empty or tqqq_hist.empty:
-        print("❌ 데이터 수집 실패.")
-        return None
+    # MA200 계산에 200행 필요 → 여유 있게 210행 요구
+    qqq_hist  = fetch_history("QQQ",   "18mo", required=True,  min_rows=210)
+    tqqq_hist = fetch_history("TQQQ",  "5y",   required=True,  min_rows=200)
+    div_hist  = fetch_history(DIV_ETF, "5d",   required=False, min_rows=1)
 
     now = datetime.now(ZoneInfo("America/Chicago")).strftime("%H:%M:%S CT")
     print(f"✅ 수집 완료 ({now})")
@@ -199,13 +249,17 @@ def get_signals():
     crash_3_hit = tqqq_price <= crash_3_price
 
     # 배당ETF 현재가 (QQQI)
-    div_price = div_hist['Close'].iloc[-1] if not div_hist.empty else None
+    div_price = None
+    if div_hist is not None and not div_hist.empty:
+        _dp = div_hist['Close'].iloc[-1]
+        if pd.notna(_dp):
+            div_price = float(_dp)
 
     # 추세 참고 지표
     above150     = bool(df['MA150'].iloc[-1] > 0 and df['Close'].iloc[-1] > df['MA150'].iloc[-1])
     golden_cross = bool(df['MA50'].iloc[-1] > df['MA200'].iloc[-1])
 
-    return {
+    result = {
         'date'           : df.index[-1].strftime("%Y년 %m월 %d일"),
         'fetch_time'     : now,
         'qqq_price'      : round(df['Close'].iloc[-1], 2),
@@ -223,7 +277,7 @@ def get_signals():
         'trigger_price'  : round(trigger_price, 2),
         'conv_triggered' : conv_triggered,
         'gain_pct'       : gain_pct,
-        'div_price'      : round(div_price, 2) if div_price else 'N/A',
+        'div_price'      : round(div_price, 2) if div_price is not None else 'N/A',
         'div_etf'        : DIV_ETF,
         'above150'       : above150,
         'golden_cross'   : golden_cross,
@@ -231,6 +285,21 @@ def get_signals():
         'ma150'          : round(df['MA150'].iloc[-1], 2),
         'ma200'          : round(df['MA200'].iloc[-1], 2),
     }
+
+    # ── 최종 관문: 하나라도 NaN 이면 메일을 보내지 않고 워크플로우를 실패시킨다 ──
+    must_be_numeric = [
+        'qqq_price', 'tqqq_price', 'tqqq_ath', 'tqqq_drop_pct',
+        'crash_1_price', 'crash_2_price', 'crash_3_price',
+        'trigger_price', 'gain_pct', 'ma50', 'ma150', 'ma200',
+    ]
+    broken = [k for k in must_be_numeric if _bad(result[k])]
+    if broken:
+        raise DataFetchError(
+            "계산 결과에 NaN 포함 → 메일 발송 중단. "
+            f"문제 항목: {', '.join(broken)}"
+        )
+
+    return result
 
 # ─────────────────────────────────────────────
 # 이메일 HTML 생성
@@ -535,10 +604,21 @@ def send_email(html_content, s):
 # 메인
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    s = get_signals()
-    if s:
-        print_signal(s)
-        html = build_signal_html(s)
-        send_email(html, s)
+    try:
+        s = get_signals()
+    except DataFetchError as e:
+        # 메일을 보내지 않고 비정상 종료 → GitHub Actions 가 Run failed 로 표시하고
+        # 실패 알림 메일을 보낸다. '$nan 메일'보다 이쪽이 훨씬 안전하다.
+        print(f"\n❌ 데이터 수집 실패 → 메일 발송하지 않음\n   사유: {e}")
+        sys.exit(1)
+
+    if not s:
+        print("\n❌ 신호 계산 실패 → 메일 발송하지 않음")
+        sys.exit(1)
+
+    print_signal(s)
+    html = build_signal_html(s)
+    send_email(html, s)
+
     if sys.stdin.isatty():
         input("\n✅ 완료. 아무 키나 누르면 창이 닫힙니다...")
