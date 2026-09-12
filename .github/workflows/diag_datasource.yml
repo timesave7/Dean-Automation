@@ -1,0 +1,129 @@
+name: DIAG - 주가 데이터 소스 진단
+
+# 일회용 진단 워크플로우. 메일 발송 없음, 시크릿 불필요, state.json 안 건드림.
+# GitHub Actions 러너에서 어떤 주가 소스가 실제로 살아있는지만 확인한다.
+#
+# 사용법:
+#   1) 이 파일을 .github/workflows/diag_datasource.yml 로 커밋
+#   2) Actions 탭 → "DIAG - 주가 데이터 소스 진단" → Run workflow
+#   3) 실행 후 로그 전체를 복사해서 Claude에게 전달
+#   4) 원인 확정되면 이 파일은 삭제
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: pip install yfinance pandas requests
+
+      - name: 진단 실행
+        run: |
+          python - <<'PY'
+          import json, sys, time, traceback
+          import requests
+
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+          def hr(t): print("\n" + "=" * 70 + f"\n{t}\n" + "=" * 70)
+
+          # ── 0. 환경 정보 ────────────────────────────────────────────
+          hr("0. 환경")
+          import yfinance, pandas
+          print("python  :", sys.version.split()[0])
+          print("yfinance:", yfinance.__version__)
+          print("pandas  :", pandas.__version__)
+          try:
+              print("러너 공인 IP:", requests.get("https://api.ipify.org", timeout=10).text)
+          except Exception as e:
+              print("IP 조회 실패:", e)
+
+          # ── 1. Yahoo chart API 직접 호출 (핵심 단서) ────────────────
+          hr("1. Yahoo chart API 직접 호출")
+          for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+              url = f"https://{host}/v8/finance/chart/TQQQ?range=5d&interval=1d"
+              for label, hdr in (("헤더없음", {}), ("UA위장", UA)):
+                  try:
+                      t0 = time.time()
+                      r = requests.get(url, headers=hdr, timeout=20)
+                      dt = time.time() - t0
+                      print(f"\n[{host} / {label}] HTTP {r.status_code}  ({dt:.2f}s)")
+                      print("  body:", r.text[:300].replace("\n", " "))
+                      if r.status_code == 200:
+                          j = r.json()
+                          res = (j.get("chart") or {}).get("result")
+                          if res:
+                              q = res[0]["indicators"]["quote"][0]
+                              print("  ✅ close 배열:", q.get("close"))
+                  except Exception as e:
+                      print(f"\n[{host} / {label}] 예외: {type(e).__name__}: {e}")
+
+          # ── 2. yfinance 실제 동작 ──────────────────────────────────
+          hr("2. yfinance history() — NaN 여부 확인")
+          import yfinance as yf
+          yf.set_tz_cache_location("/tmp/yf_no_cache")
+          for sym, period in (("QQQ", "18mo"), ("TQQQ", "5y"), ("QQQI", "5d")):
+              try:
+                  t0 = time.time()
+                  h = yf.Ticker(sym).history(period=period, auto_adjust=True, repair=False)
+                  dt = time.time() - t0
+                  if h is None or h.empty:
+                      print(f"{sym:6} ❌ empty DataFrame ({dt:.2f}s)")
+                      continue
+                  n, valid = len(h), int(h["Close"].notna().sum())
+                  mark = "✅" if valid else "❌ 전부 NaN ← 이게 버그 원인"
+                  print(f"{sym:6} {mark}  전체 {n}행 / Close 유효 {valid}행 ({dt:.2f}s)")
+                  if valid:
+                      print(f"       최근가 {h['Close'].dropna().iloc[-1]:.2f}")
+              except Exception as e:
+                  print(f"{sym:6} 예외: {type(e).__name__}: {e}")
+
+          # ── 3. 대체 소스 후보 ──────────────────────────────────────
+          hr("3. 대체 소스 후보")
+
+          def probe(name, url, check):
+              try:
+                  t0 = time.time()
+                  r = requests.get(url, headers=UA, timeout=20)
+                  dt = time.time() - t0
+                  ok, note = check(r)
+                  print(f"[{name}] HTTP {r.status_code} ({dt:.2f}s) {'✅' if ok else '❌'} {note}")
+              except Exception as e:
+                  print(f"[{name}] 예외: {type(e).__name__}: {e}")
+
+          def csv_check(r):
+              first = r.text.strip().split("\n")[0][:80]
+              rows = len(r.text.strip().split("\n"))
+              return (r.status_code == 200 and "Date" in first), f"{rows}행, 첫줄={first!r}"
+
+          probe("Stooq CSV (TQQQ)",
+                "https://stooq.com/q/d/l/?s=tqqq.us&i=d", csv_check)
+          probe("Stooq CSV (QQQ)",
+                "https://stooq.com/q/d/l/?s=qqq.us&i=d", csv_check)
+
+          def json_check(key):
+              def _c(r):
+                  try:
+                      j = r.json()
+                  except Exception:
+                      return False, r.text[:150].replace("\n", " ")
+                  return (key in json.dumps(j)[:2000]), json.dumps(j)[:250]
+              return _c
+
+          probe("Yahoo quote v7",
+                "https://query1.finance.yahoo.com/v7/finance/quote?symbols=TQQQ",
+                json_check("regularMarketPrice"))
+          probe("Yahoo quote v6",
+                "https://query2.finance.yahoo.com/v6/finance/quote?symbols=TQQQ",
+                json_check("regularMarketPrice"))
+          probe("Stooq 단일시세",
+                "https://stooq.com/q/l/?s=tqqq.us&f=sd2t2ohlcv&h&e=csv", csv_check)
+
+          hr("진단 끝 — 이 로그 전체를 복사해 Claude에게 전달")
+          PY
