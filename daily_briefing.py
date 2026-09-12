@@ -241,15 +241,28 @@ def fetch_market_data():
         "미국10년국채":"^TNX","VIX":"^VIX",
     }
     data = {}
+    skipped = []
     for name, sym in tickers.items():
         try:
             h = yf.Ticker(sym).history(period="5d")
-            if not h.empty:
-                price = h['Close'].iloc[-1]
-                prev = h['Close'].iloc[-2] if len(h)>=2 else price
-                data[name] = {"price":price,"change":((price-prev)/prev)*100}
-        except: pass
+            # Yahoo는 아직 값이 안 채워진 빈 바를 맨 뒤에 하나 붙여서 준다.
+            # 그대로 .iloc[-1] 하면 NaN 이 잡혀 $nan 으로 표시된다. 빈 행을 먼저 버린다.
+            if h is not None and not h.empty:
+                h = h[h['Close'].notna()]
+            if h is None or h.empty:
+                skipped.append(name)
+                continue
+            price = float(h['Close'].iloc[-1])
+            prev  = float(h['Close'].iloc[-2]) if len(h) >= 2 else price
+            if prev == 0:
+                skipped.append(name)
+                continue
+            data[name] = {"price":price,"change":((price-prev)/prev)*100}
+        except Exception:
+            skipped.append(name)
     print(f"    수집 완료: {len(data)}개 종목")
+    if skipped:
+        print(f"    ⚠️  수집 실패 {len(skipped)}개: {', '.join(skipped)}")
     return data
  
 def fetch_economic_events():
