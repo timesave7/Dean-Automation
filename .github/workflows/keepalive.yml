@@ -7,79 +7,99 @@ name: Keepalive (60-day inactivity guard)
 #  60일 시계를 매달 리셋하고, 혹시 이미 꺼진 워크플로우가 있으면 다시 켠다.
 #
 # 사전 준비 (1회):
-#  1) GitHub → Settings → Developer settings → Personal access tokens
-#     → Tokens (classic) → Generate new token (classic)
-#     - Note: KEEPALIVE_PAT
-#     - Expiration: No expiration (또는 1년 — 만료되면 이 방어책도 같이 죽는다)
-#     - Scopes: [x] repo   [x] workflow
-#  2) 저장소 → Settings → Secrets and variables → Actions → New repository secret
-#     - Name: KEEPALIVE_PAT
-#     - Secret: 위에서 생성한 토큰 값
+#  1) PAT(classic) 발급 — scope: repo + workflow, 만료 No expiration
+#  2) 저장소 → Settings → Secrets and variables → Actions
+#     → New repository secret → Name: KEEPALIVE_PAT
 #  3) 이 파일을 .github/workflows/keepalive.yml 로 커밋
-#  4) Actions 탭 → Keepalive → "Run workflow" 로 1회 수동 실행해서 동작 확인
+#  4) Actions → Keepalive → Run workflow 로 1회 수동 실행
 
 on:
   schedule:
-    # 매월 1일과 15일 12:00 UTC (CT 기준 오전 6~7시). 두 번 도는 이유는
-    # 한 번 실패해도 60일 안에 반드시 한 번은 성공하게 하기 위함.
+    # 매월 1일과 15일 12:00 UTC. 두 번 도는 이유는 한 번 실패해도
+    # 60일 안에 반드시 한 번은 성공하게 하기 위함.
     - cron: '0 12 1,15 * *'
   workflow_dispatch:
 
 permissions:
-  actions: write      # 비활성화된 워크플로우를 다시 켜기 위해 필요
+  actions: write
   contents: read
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
+    env:
+      PAT: ${{ secrets.KEEPALIVE_PAT }}
+
     steps:
-      - name: Checkout (PAT 사용 — 이게 핵심)
+      # ── 0. 시크릿부터 확인. 없으면 여기서 명확하게 멈춘다 ──────────────
+      - name: KEEPALIVE_PAT 시크릿 확인
+        run: |
+          if [ -z "${PAT}" ]; then
+            echo "::error::KEEPALIVE_PAT 시크릿이 비어 있습니다."
+            echo ""
+            echo "확인할 것:"
+            echo "  1) 저장소 Settings → Secrets and variables → Actions 에"
+            echo "     이름이 정확히 'KEEPALIVE_PAT' 인 항목이 있는가"
+            echo "     (대소문자·밑줄까지 일치해야 함. 앞뒤 공백 주의)"
+            echo "  2) 'Environment secrets'가 아니라 'Repository secrets' 쪽에 있는가"
+            echo "  3) timesave7/Dean-Automation 저장소가 맞는가"
+            exit 1
+          fi
+          echo "✅ KEEPALIVE_PAT 확인됨 (길이 ${#PAT}자)"
+
+      # ── 1. 체크아웃은 기본 토큰으로. PAT에 의존하지 않는다 ─────────────
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.KEEPALIVE_PAT }}
           fetch-depth: 0
 
-      - name: 활동 커밋 남기기 (60일 시계 리셋)
+      # ── 2. PAT로 직접 push → 60일 비활성 타이머 리셋 ──────────────────
+      - name: 활동 커밋 남기기
         run: |
           set -euo pipefail
 
-          # 커밋 작성자를 Dean 계정으로. 이메일 노출이 싫으면 아래 noreply 주소 사용.
-          # 정확한 noreply 주소는 GitHub → Settings → Emails 에서 확인 가능
-          # (형식: 12345678+timesave7@users.noreply.github.com)
           git config user.name  "timesave7"
           git config user.email "timesave7@users.noreply.github.com"
 
           mkdir -p .github
           date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/.keepalive
 
-          if git diff --quiet .github/.keepalive; then
-            echo "변경 없음 — 빈 커밋으로 대체"
+          if git diff --quiet -- .github/.keepalive; then
             git commit --allow-empty -m "chore: keepalive $(date -u '+%Y-%m-%d')"
           else
             git add .github/.keepalive
             git commit -m "chore: keepalive $(date -u '+%Y-%m-%d')"
           fi
 
-          git push
+          # 인증 정보를 URL에 직접 실어 push (checkout의 자격증명에 의존하지 않음).
+          # 혹시라도 로그에 URL이 찍히면 토큰 부분을 가린다.
+          git push "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git" \
+                   "HEAD:${GITHUB_REF_NAME}" 2>&1 | sed -E 's#https://[^@]*@#https://#g'
+
           echo "✅ push 완료 — 60일 비활성 타이머 리셋됨"
 
-      - name: 비활성화된 워크플로우 자동 재활성화 (보험)
+      # ── 3. 비활성화된 워크플로우 자동 재활성화 (2차 방어) ──────────────
+      - name: 꺼진 워크플로우 다시 켜기
         env:
           GH_TOKEN: ${{ secrets.KEEPALIVE_PAT }}
         run: |
           set -euo pipefail
-          found=0
-          # state 가 disabled_inactivity 인 워크플로우를 모두 다시 켠다
           gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
             --jq '.workflows[] | select(.state=="disabled_inactivity") | "\(.id)\t\(.name)"' \
-          | while IFS=$'\t' read -r id name; do
+            > /tmp/disabled.tsv || true
+
+          if [ -s /tmp/disabled.tsv ]; then
+            while IFS=$'\t' read -r id name; do
               echo "재활성화: $name (id=$id)"
               gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/enable"
-              found=1
-            done
-          echo "점검 완료"
+            done < /tmp/disabled.tsv
+          else
+            echo "꺼진 워크플로우 없음"
+          fi
 
-      - name: 현재 워크플로우 상태 요약
+      # ── 4. 상태 요약을 실행 결과 화면에 표로 출력 ──────────────────────
+      - name: 워크플로우 상태 요약
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.KEEPALIVE_PAT }}
         run: |
@@ -89,5 +109,5 @@ jobs:
             echo "| 워크플로우 | 상태 |"
             echo "|---|---|"
             gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
-              --jq '.workflows[] | "| \(.name) | \(.state) |"'
+              --jq '.workflows[] | "| \(.name) | \(.state) |"' || echo "| (조회 실패) | - |"
           } >> "$GITHUB_STEP_SUMMARY"
