@@ -1,0 +1,93 @@
+name: Keepalive (60-day inactivity guard)
+
+# 목적:
+#  GitHub은 저장소에 60일간 "사용자 활동"이 없으면 모든 scheduled workflow를
+#  자동으로 비활성화한다. github-actions[bot] 커밋(예: update_cost_basis)은
+#  활동으로 인정되지 않는다. 이 워크플로우는 PAT로 실제 사용자 커밋을 남겨
+#  60일 시계를 매달 리셋하고, 혹시 이미 꺼진 워크플로우가 있으면 다시 켠다.
+#
+# 사전 준비 (1회):
+#  1) GitHub → Settings → Developer settings → Personal access tokens
+#     → Tokens (classic) → Generate new token (classic)
+#     - Note: KEEPALIVE_PAT
+#     - Expiration: No expiration (또는 1년 — 만료되면 이 방어책도 같이 죽는다)
+#     - Scopes: [x] repo   [x] workflow
+#  2) 저장소 → Settings → Secrets and variables → Actions → New repository secret
+#     - Name: KEEPALIVE_PAT
+#     - Secret: 위에서 생성한 토큰 값
+#  3) 이 파일을 .github/workflows/keepalive.yml 로 커밋
+#  4) Actions 탭 → Keepalive → "Run workflow" 로 1회 수동 실행해서 동작 확인
+
+on:
+  schedule:
+    # 매월 1일과 15일 12:00 UTC (CT 기준 오전 6~7시). 두 번 도는 이유는
+    # 한 번 실패해도 60일 안에 반드시 한 번은 성공하게 하기 위함.
+    - cron: '0 12 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write      # 비활성화된 워크플로우를 다시 켜기 위해 필요
+  contents: read
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (PAT 사용 — 이게 핵심)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.KEEPALIVE_PAT }}
+          fetch-depth: 0
+
+      - name: 활동 커밋 남기기 (60일 시계 리셋)
+        run: |
+          set -euo pipefail
+
+          # 커밋 작성자를 Dean 계정으로. 이메일 노출이 싫으면 아래 noreply 주소 사용.
+          # 정확한 noreply 주소는 GitHub → Settings → Emails 에서 확인 가능
+          # (형식: 12345678+timesave7@users.noreply.github.com)
+          git config user.name  "timesave7"
+          git config user.email "timesave7@users.noreply.github.com"
+
+          mkdir -p .github
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > .github/.keepalive
+
+          if git diff --quiet .github/.keepalive; then
+            echo "변경 없음 — 빈 커밋으로 대체"
+            git commit --allow-empty -m "chore: keepalive $(date -u '+%Y-%m-%d')"
+          else
+            git add .github/.keepalive
+            git commit -m "chore: keepalive $(date -u '+%Y-%m-%d')"
+          fi
+
+          git push
+          echo "✅ push 완료 — 60일 비활성 타이머 리셋됨"
+
+      - name: 비활성화된 워크플로우 자동 재활성화 (보험)
+        env:
+          GH_TOKEN: ${{ secrets.KEEPALIVE_PAT }}
+        run: |
+          set -euo pipefail
+          found=0
+          # state 가 disabled_inactivity 인 워크플로우를 모두 다시 켠다
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state=="disabled_inactivity") | "\(.id)\t\(.name)"' \
+          | while IFS=$'\t' read -r id name; do
+              echo "재활성화: $name (id=$id)"
+              gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/enable"
+              found=1
+            done
+          echo "점검 완료"
+
+      - name: 현재 워크플로우 상태 요약
+        env:
+          GH_TOKEN: ${{ secrets.KEEPALIVE_PAT }}
+        run: |
+          {
+            echo "### 워크플로우 상태"
+            echo ""
+            echo "| 워크플로우 | 상태 |"
+            echo "|---|---|"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+              --jq '.workflows[] | "| \(.name) | \(.state) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
