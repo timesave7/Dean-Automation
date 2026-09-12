@@ -47,16 +47,26 @@ jobs:
           fi
           echo "✅ KEEPALIVE_PAT 확인됨 (길이 ${#PAT}자)"
 
-      # ── 1. 체크아웃은 기본 토큰으로. PAT에 의존하지 않는다 ─────────────
+      # ── 1. 체크아웃 ────────────────────────────────────────────────────
+      #  persist-credentials: false 가 핵심.
+      #  기본값(true)이면 checkout 이 git 전역 설정에
+      #    http.https://github.com/.extraheader = AUTHORIZATION: basic <GITHUB_TOKEN>
+      #  을 심어두는데, 이 헤더가 github.com 으로 가는 모든 요청에 적용되어
+      #  아래에서 URL에 실어 보내는 PAT를 덮어쓴다. 그 결과 권한 없는
+      #  github-actions[bot] 으로 push 되어 403이 난다.
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # ── 2. PAT로 직접 push → 60일 비활성 타이머 리셋 ──────────────────
       - name: 활동 커밋 남기기
         run: |
           set -euo pipefail
+
+          # 혹시 남아 있을 수 있는 checkout 자격증명 헤더를 확실히 제거
+          git config --unset-all http."https://github.com/".extraheader 2>/dev/null || true
 
           git config user.name  "timesave7"
           git config user.email "timesave7@users.noreply.github.com"
